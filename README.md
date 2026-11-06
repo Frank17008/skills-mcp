@@ -1,2 +1,2 @@
 # skills-mcp
-A tool that transform skills to mcp server
+A tool that transforms skills into a mcp server
