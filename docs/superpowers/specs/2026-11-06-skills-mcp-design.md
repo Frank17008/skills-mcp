@@ -436,10 +436,10 @@ npm run build       # tsup
 ```
 
 - `tsup.config.ts`：`entry: ['src/index.ts']`、`format: ['esm']`、`target: 'node20'`、`clean: true`、`banner: { js: '#!/usr/bin/env node' }`。
-- `src/index.ts` 首行也保留 shebang（tsup banner 保证产物可执行）。
+- `tsup` banner 注入 shebang；`src/index.ts` 不手写 shebang，避免产物出现重复 shebang。
 - 依赖：`@modelcontextprotocol/sdk`、`gray-matter`、`zod`。
 - 开发依赖：`typescript`、`tsup`、`tsx`、`vitest`、`@types/node`。
-- 仓库初始只有本地 git，不配置 remote；发布前由用户决定 remote 与 npm 发布。
+- 远程仓库：`https://github.com/Frank17008/skills-mcp.git`。实现完成后直接推送到 `origin main`；npm 发布仍由用户决定。
 
 ## 11. README 配置示例
 
@@ -490,6 +490,7 @@ Cursor（`.cursor/mcp.json`）结构同 Claude Desktop。
 7. 二进制文件读取返回 `isError`。
 8. 无效 skill 目录（不存在 / 无 `SKILL.md`）启动时 exit 1 并输出明确错误。
 9. `npm run typecheck && npm test && npm run build` 全部通过。
+10. 代码提交并推送到 `origin main`（`https://github.com/Frank17008/skills-mcp.git`）。
 
 ## 13. 未来扩展（非本期）
 
