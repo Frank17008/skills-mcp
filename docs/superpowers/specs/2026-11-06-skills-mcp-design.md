@@ -135,9 +135,10 @@ type SkillIndex = {
 - 递归 `readdir({ withFileTypes: true })`。
 - 跳过目录/文件名：`.git`、`node_modules`、`dist`、`.DS_Store`。
 - 符号链接：
-  - `realpath` 后仍在 `realRoot` 内 → 以真实路径收录；
+  - 遍历条目按名称升序，保证顺序确定；
+  - `realpath` 后仍在 `realRoot` 内 → 收录，`relPath` 记录链接所在相对路径，`absPath` 记录真实路径；
   - 解析到 `realRoot` 外 → 跳过并写 stderr 警告；
-  - 目录软链用已访问 realpath 集合去重，防止循环。
+  - 按 `absPath`（realpath）去重，先遍历到的条目优先；目录软链额外用已访问 realpath 集合防止循环。
 - 文件大小取 `stat.size`。
 - `isText` 判定见 8.3。
 - 文本 `.md` 文件提取 `title`：第一行匹配 `/^#\s+(.+?)\s*$/` 的内容，找不到则 `undefined`。
@@ -193,7 +194,7 @@ type SkillIndex = {
 ```ts
 z.object({ dir: z.string().optional() })
 ```
-- `dir` 为 relPath 前缀过滤（如 `references/docs`）；不传则返回全部；不是真实文件系统查询，只过滤索引。
+- `dir` 为 relPath 前缀过滤（如 `references/docs`，路径段匹配，见 §8.1）；不传则返回全部；不是真实文件系统查询，只过滤索引。
 - 返回 JSON：
 ```ts
 { count: number; files: Array<{ path: string; size: number; title?: string; mimeType: string; isText: boolean }> }
@@ -211,12 +212,15 @@ z.object({
 ```
 - `path` 必须存在于启动索引（relPath，精确匹配，允许 `./` 前缀被规范化）。不存在 → `isError`，提示先调用 `list_files`。
 - 非文本文件 → `isError`（"Binary file cannot be read as text"）。
-- 文件大小超过 `MAX_READ_BYTES` → `isError`，提示改用 `search_skill`。
-- 按行切片，返回 JSON：
+- 按行流式读取：从 `offset` 行开始，最多返回 `limit` 行，且单次返回内容不超过 `MAX_READ_BYTES`（在行边界截断）。
+  - 文件总大小不受 `MAX_READ_BYTES` 限制，大文件通过 `offset` / `limit` 分页读取。
+  - 若单行本身超过 `MAX_READ_BYTES` → `isError`，提示增大 `SKILL_MCP_MAX_READ_BYTES`。
+- 返回 JSON：
 ```ts
-{ path: string; offset: number; limit: number; totalLines: number; truncated: boolean; content: string }
+{ path: string; offset: number; limit: number; totalLines: number; returnedLines: number; truncated: boolean; content: string }
 ```
-- `truncated` 表示 `offset + 返回行数 < totalLines`。
+- `totalLines` 通过流式计数得到，不整体载入内存。
+- `truncated = (offset - 1 + returnedLines) < totalLines`，表示后面还有未返回的行。
 
 #### `search_skill`
 
@@ -228,17 +232,17 @@ z.object({
   caseSensitive: z.boolean().optional(),    // 默认 false
   maxResults: z.number().int().min(1).max(200).optional(), // 默认 50
   contextLines: z.number().int().min(0).max(5).optional(), // 默认 2
-  pathPrefix: z.string().optional(),        // relPath 前缀过滤
+  pathPrefix: z.string().optional(),        // relPath 前缀过滤（路径段匹配，见 §8.1）
 })
 ```
-- 只搜索文本文件，且跳过大小超过 `MAX_READ_BYTES` 的文件。
+- 只搜索文本文件；大小超过 `MAX_READ_BYTES` 的文件跳过并计入 `skippedLarge`，这类文件可用 `read_file` 分页读取。
 - `regex: true` 时把 `query` 当正则；非法正则 → `isError`。
-- 逐行匹配，命中行前后各取 `contextLines` 行作为 `snippet`（用 `\n` 连接）。
+- 逐行匹配：同一行出现多处命中只计为一条结果，`column` 取首个命中位置；命中行前后各取 `contextLines` 行作为 `snippet`（用 `\n` 连接）。
 - 返回 JSON：
 ```ts
 {
   query: string;
-  total: number;      // 命中总数（可能大于 results.length）
+  total: number;      // 命中行数（可能大于 results.length）
   limited: boolean;   // 是否因 maxResults 截断
   skippedBinary: number;
   skippedLarge: number;
@@ -246,6 +250,7 @@ z.object({
 }
 ```
 - `line` / `column` 均为 1-based。
+- `skippedBinary` 统计范围内所有非文本文件数；`skippedLarge` 统计因超过 `MAX_READ_BYTES` 而未扫描的文本文件数。
 
 ### 6.2 Resources
 
@@ -261,7 +266,8 @@ z.object({
   1. 从 URI 去掉 `skill://` 前缀，逐段 `decodeURIComponent` 还原 relPath；
   2. 在索引中精确查找；找不到 → 抛错；
   3. 重新 `realpath` 并校验仍在 root 内；
-  4. 按 UTF-8 读取，返回 `{ contents: [{ uri: uri.href, mimeType, text }] }`。
+  4. 若文件大小超过 `MAX_READ_BYTES` → 抛错，提示使用 `read_file` 的 `offset` / `limit` 分页读取；
+  5. 按 UTF-8 读取，返回 `{ contents: [{ uri: uri.href, mimeType, text }] }`。
 - 非文本文件不注册；`resources/list` 只返回文本文件。
 - 资源在启动时一次性注册，运行期新增文件不会出现在 `resources/list`，需重启。
 
@@ -301,8 +307,9 @@ Options:
 1. 输入拒绝：包含 `\0`、绝对路径（`path.isAbsolute`）→ 抛错。
 2. 统一分隔符为 `/`，用 `path.posix.normalize` 规范化。
 3. 规范化为 `..` 或以 `../` 开头 → 抛错。
-4. 只接受索引中存在的 `relPath`（精确匹配）；`list_files` 的 `dir`、`search_skill` 的 `pathPrefix` 仅做字符串前缀过滤，不触碰文件系统。
-5. 读取前再对 `absPath` 做一次 `fs.realpath`，确认仍在 `realpath(root)` 内；否则抛错。
+4. `read_file` / resources 只接受索引中存在的 `relPath`（精确匹配）。
+5. `list_files.dir` 与 `search_skill.pathPrefix` 先按步骤 1–3 规范化，并去掉末尾的 `/`（除非为空），再做**路径段前缀**匹配：`relPath === prefix` 或 `relPath.startsWith(prefix + '/')`；不触碰文件系统。
+6. 读取前再对 `absPath` 做一次 `fs.realpath`，确认仍在 `realpath(root)` 内；否则抛错。
 
 扫描阶段已经过滤掉指向 root 外的符号链接，因此索引天然不含越界路径。
 
@@ -310,7 +317,7 @@ Options:
 
 | 项 | 默认值 | 覆盖方式 |
 |---|---|---|
-| `MAX_READ_BYTES`（单文件读取/搜索扫描上限） | 1 MiB（1048576） | 环境变量 `SKILL_MCP_MAX_READ_BYTES`（正整数） |
+| `MAX_READ_BYTES`（单次读取返回上限 / 搜索单文件扫描上限 / resource 单文件读取上限） | 1 MiB（1048576） | 环境变量 `SKILL_MCP_MAX_READ_BYTES`（正整数） |
 | `read_file.limit` | 2000 行 | 入参，最大 10000 |
 | `search_skill.maxResults` | 50 | 入参，最大 200 |
 | `search_skill.contextLines` | 2 | 入参，最大 5 |
@@ -328,7 +335,7 @@ Options:
 ### 8.4 日志与 stdout 纪律
 
 - **stdout 只能输出 MCP JSON-RPC**。所有日志统一走 `src/logger.ts`，写 `process.stderr`，前缀 `[skills-mcp]`。
-- 禁止业务代码使用 `console.log`；ESLint 配置 `no-console`（允许 `error` / `warn`，二者天然写 stderr）。
+- 业务代码禁止使用 `console.log`，统一通过 `src/logger.ts` 写 stderr；ESLint 规则不在本期范围（见 §13）。
 - `--help` / `--version` 是 CLI 模式，可写 stdout。
 
 ### 8.5 错误消息约定
@@ -340,7 +347,8 @@ Options:
 - `File not found: <relPath>. Call list_files to see available files.`
 - `Path outside skill directory is not allowed: <input>`
 - `Binary file cannot be read as text: <relPath>`
-- `File too large (<size> bytes, limit <limit>). Use search_skill instead.`
+- `Line too long (exceeds <limit> bytes). Increase SKILL_MCP_MAX_READ_BYTES.`（`read_file` 单行超限）
+- `File too large for resource read (<size> bytes, limit <limit>). Use read_file with offset/limit.`（resource 读取超限）
 - `Invalid regular expression: <message>`
 
 ## 9. 测试策略
@@ -378,9 +386,10 @@ Options:
   - `pathPrefix` 过滤。
   - 二进制与超限文件被跳过并计数。
 - **read-file**
-  - 默认读取全文。
-  - `offset` / `limit` 切片、`truncated`、`totalLines` 正确。
-  - 不存在文件、二进制文件、超限文件返回 `isError`。
+  - 默认读取前 2000 行（fixture 文件小于 2000 行时即全文）。
+  - `offset` / `limit` 切片、`returnedLines`、`truncated`、`totalLines` 正确（含 10 行文件读取第 5–9 行的边界用例）。
+  - 超过 `MAX_READ_BYTES` 的文件可通过 `offset` / `limit` 分页读取，且在字节上限处按行截断。
+  - 单行超限、不存在文件、二进制文件返回 `isError`。
 
 ### 9.3 集成测试
 
@@ -489,4 +498,5 @@ Cursor（`.cursor/mcp.json`）结构同 Claude Desktop。
 - MCP Prompts（把 `SKILL.md` 暴露为可选 prompt）。
 - 文件监听与动态索引刷新。
 - `search_skill` 支持 glob `include` 与语义检索。
+- ESLint / 格式化配置（含 `no-console` 规则）。
 - 发布到 npm 并补充 CI 工作流。
